@@ -15,5 +15,3 @@ PRs from forked repository not accepted.
 
 - (Please write a description for this change.)
 
-## Changelog
-
