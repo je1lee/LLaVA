@@ -63,9 +63,8 @@ export TAG=v$(cat ./VERSION) && docker compose -f docker-compose-private.yml run
 Chat about images using LLaVA without the need of Gradio interface. It also supports multiple GPUs, 4-bit and 8-bit quantized inference. With 4-bit quantization, for our LLaVA-1.5-7B, it uses less than 8GB VRAM on a single GPU.
 
 ```Shell
-python -m llava.serve.cli \
+python -m llava.serve.edgefm_webui \
     --model-path liuhaotian/llava-v1.5-7b \
-    --image-file "https://llava-vl.github.io/static/images/view.jpg" \
     --load-4bit
 ```
 
