@@ -1,5 +1,5 @@
 > **Note**
-> If you PR to `dev` branch, please add a brief summary of the change to the **Upcoming Release** section of the [`CHANGELOG.md`](https://github.com/Nota-NetsPresso/netspresso-trainer/blob/master/CHANGELOG.md) file and include a link to the PR (formatted in markdown) and a link to your github profile.
+> If you PR to `dev` branch, please add a brief summary of the change to the **Upcoming Release** section of the [`CHANGELOG.md`](https://github.com/nota-github/edgefm-llava/blob/dev/CHANGELOG.md) file and include a link to the PR (formatted in markdown) and a link to your github profile.
 > 
 
 ## Description
