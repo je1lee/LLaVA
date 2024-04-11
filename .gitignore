@@ -34,3 +34,7 @@ ckpts*
 
 # Demo
 serve_images/
+
+
+# Nota AI
+docker-compose-private.yml

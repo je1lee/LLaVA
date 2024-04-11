@@ -1,0 +1,29 @@
+version: "3.9"
+
+# export TAG=v$(cat ./VERSION) && docker compose run --service-ports --name edgefm-llava-torch edgefm-llava-torch bash
+
+services:
+  edgefm-llava-torch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: edgefm-llava-torch:${TAG}
+    container_name: edgefm-llava-torch
+    ipc: host
+    ports:
+      - "50002:50002" # (optional, gradio) configuration helper
+      - "50003:50003" # (optional, gradio) inference demo
+    volumes:
+      # from path: your working directory
+      # - /PATH/TO/edgefm-llava:/workspace
+      # from path: your dataset directory
+      - /PATH/TO/DATA:/DATA
+      # from path: your checkpoint directory
+      - /PATH/TO/CHECKPOINT:/CHECKPOINT
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["4", "5", "6", "7"] # your GPU id(s)
+              capabilities: [gpu]
