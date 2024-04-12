@@ -60,7 +60,7 @@ class VLMWebUI:
     def inference_from_streaming_frame(self, image: Image.Image, input_text: str) -> str:
         
         # TODO: support multi-turn conversation with the single frame 
-        conversation = conv_templates[args.conv_mode].copy()
+        conversation = conv_templates[self.args.conv_mode].copy()
         
         image_size = image.size
         # Similar operation in model_worker.py
@@ -89,9 +89,9 @@ class VLMWebUI:
             streamer=streamer,
             images=image_tensor,
             image_sizes=[image_size],
-            do_sample=True if args.temperature > 0 else False,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
+            do_sample=True if self.args.temperature > 0 else False,
+            temperature=self.args.temperature,
+            max_new_tokens=self.args.max_new_tokens,
             use_cache=True
         )
         thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
