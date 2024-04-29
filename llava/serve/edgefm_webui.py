@@ -1,5 +1,6 @@
 import argparse
 import torch
+from dataclasses import dataclass
 
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.conversation import conv_templates, SeparatorStyle
@@ -10,15 +11,19 @@ from llava.mm_utils import process_images, tokenizer_image_token, get_model_name
 import requests
 from PIL import Image
 from io import BytesIO
-from transformers import TextIteratorStreamer
+from transformers import TextStreamer, TextIteratorStreamer
 import numpy as np
-from typing import Iterator
+from typing import Iterator, Optional, Tuple
 
 from threading import Thread
 
+@dataclass
+class QueryImage:
+    tensor: torch.Tensor
+    size: Tuple[int, int]
 
 class VLMWebUI:
-    def __init__(self, args) -> Iterator[str]:
+    def __init__(self, args):
         # Model
         disable_torch_init()
 
@@ -46,21 +51,35 @@ class VLMWebUI:
             print('[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}'.format(conv_mode, args.conv_mode, args.conv_mode))
         else:
             args.conv_mode = conv_mode
+        self.args = args
 
-        conversation = conv_templates[args.conv_mode].copy()
+        self._is_conversation_with_context = False
+        self.conversation = self.initialized_conversation()
         if "mpt" in model_name.lower():
             roles = ('user', 'assistant')
         else:
-            roles = conversation.roles
+            roles = self.conversation.roles
         
         self.roles = roles
-        self.args = args
+    
+    def initialized_conversation(self):
+        """Refresh conversation history. This function intends only single-user scenario.
+
+        Returns:
+            Conversation: Initialized conversation
+        """
+        self._is_conversation_with_context = False
+        self._query_image = None
+        new_conversation = conv_templates[args.conv_mode].copy()
+        return new_conversation
 
     @torch.inference_mode
     def inference_from_streaming_frame(self, image: Image.Image, input_text: str) -> str:
         
-        # TODO: support multi-turn conversation with the single frame 
-        conversation = conv_templates[self.args.conv_mode].copy()
+        # Initialize conversation
+        assert not self._is_conversation_with_context, \
+            f"This behavior will delete all the previous conversations. If you still want this behavior, please re-initialize the class instance."
+        self.conversation = self.initialized_conversation()
         
         image_size = image.size
         # Similar operation in model_worker.py
@@ -75,13 +94,13 @@ class VLMWebUI:
             input_text = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + input_text
         else:
             input_text = DEFAULT_IMAGE_TOKEN + '\n' + input_text
-        conversation.append_message(conversation.roles[0], input_text)
+        self.conversation.append_message(self.conversation.roles[0], input_text)
         image = None
-        conversation.append_message(conversation.roles[1], None)
-        prompt = conversation.get_prompt()
+        self.conversation.append_message(self.conversation.roles[1], None)
+        prompt = self.conversation.get_prompt()
 
         input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(self.model.device)
-        stop_str = conversation.sep if conversation.sep_style != SeparatorStyle.TWO else conversation.sep2
+        stop_str = self.conversation.sep if self.conversation.sep_style != SeparatorStyle.TWO else self.conversation.sep2
         
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
         generation_kwargs = dict(
@@ -98,6 +117,53 @@ class VLMWebUI:
         thread.start()
         return streamer
 
+    @torch.inference_mode
+    def inference(self, image: Optional[Image.Image], input_text: str) -> str:
+        
+        if image is not None:
+            # First message
+            self.conversation = self.initialized_conversation()
+
+            image_size = image.size
+            # Similar operation in model_worker.py
+            image_tensor = process_images([image], self.image_processor, self.model.config)
+            if type(image_tensor) is list:
+                image_tensor = [image.to(self.model.device, dtype=torch.float16) for image in image_tensor]
+            else:
+                image_tensor = image_tensor.to(self.model.device, dtype=torch.float16)
+            
+            if self.model.config.mm_use_im_start_end:
+                input_text = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + input_text
+            else:
+                input_text = DEFAULT_IMAGE_TOKEN + '\n' + input_text
+            self._query_image = QueryImage(tensor=image_tensor, size=image_size)
+            
+        else:
+            # Later message
+            self._is_conversation_with_context = True
+            assert self._query_image is not None, f"You should give an image at first!"
+            
+        self.conversation.append_message(self.conversation.roles[0], input_text)
+        self.conversation.append_message(self.conversation.roles[1], None)
+        prompt = self.conversation.get_prompt()
+
+        input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(self.model.device)
+        stop_str = self.conversation.sep if self.conversation.sep_style != SeparatorStyle.TWO else self.conversation.sep2
+                
+        output_ids = self.model.generate(
+            input_ids,
+            images=self._query_image.tensor,
+            image_sizes=[self._query_image.size],
+            do_sample=True if self.args.temperature > 0 else False,
+            temperature=self.args.temperature,
+            max_new_tokens=self.args.max_new_tokens,
+            use_cache=True
+        )
+        outputs = self.tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+        self.conversation.messages[-1][-1] = f"<s> {outputs}</s>"  # save with special token <s>...</s>
+        
+        return outputs
+
 def main(args):
     print(args)
     vlm_webui = VLMWebUI(args)
@@ -110,7 +176,7 @@ def main(args):
         "samples/image5.png",
     ]
     
-    prompts = [
+    independent_prompts = [
         "What happens in this scene?",
         "Please answer in json format: \{ Car: boolean \}",
         "How many people in this scene?",
@@ -119,21 +185,40 @@ def main(args):
         "What is the background color of this image?"
     ]
     
-    iteration_test = 100
+    chat_prompts = [
+        "What happens in this scene?",
+        "Please count the number of the car if there is any car.",
+        "Really? Are you sure? Tell me a reason.",
+        "Then how about an apple?",
+        "Now, please describe the scene with the information about car and apple."
+    ]
+    
+    iteration_test = 5
+    # Video streaming
     for idx in range(iteration_test):
         
         image = images[idx % len(images)]
-        prompt = prompts[idx % len(prompts)]
+        prompt = independent_prompts[idx % len(independent_prompts)]
         
         output_iterator = vlm_webui.inference_from_streaming_frame(Image.open(image).convert('RGB'), prompt)
         
         for chunk in output_iterator:
             print(chunk, flush=True, end="")
         print()
+    
+    # Conversation with the single image
+    for idx in range(len(chat_prompts)):
+        
+        image = images[0]
+        prompt = chat_prompts[idx]
+        
+        image_query = Image.open(image).convert('RGB') if idx == 0 else None
+        output = vlm_webui.inference(image_query, prompt)
+        print(output)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="facebook/opt-350m")
+    parser.add_argument("--model-path", type=str, default="liuhaotian/llava-v1.5-7b")
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--conv-mode", type=str, default=None)
