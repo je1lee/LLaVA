@@ -70,7 +70,7 @@ class VLMWebUI:
         """
         self._is_conversation_with_context = False
         self._query_image = None
-        new_conversation = conv_templates[args.conv_mode].copy()
+        new_conversation = conv_templates[self.args.conv_mode].copy()
         return new_conversation
 
     @torch.inference_mode
@@ -94,9 +94,9 @@ class VLMWebUI:
             input_text = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + input_text
         else:
             input_text = DEFAULT_IMAGE_TOKEN + '\n' + input_text
-        self.conversation.append_message(self.conversation.roles[0], input_text)
+        self.conversation.append_message(self.roles[0], input_text)
         image = None
-        self.conversation.append_message(self.conversation.roles[1], None)
+        self.conversation.append_message(self.roles[1], None)
         prompt = self.conversation.get_prompt()
 
         input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(self.model.device)
@@ -143,8 +143,8 @@ class VLMWebUI:
             self._is_conversation_with_context = True
             assert self._query_image is not None, f"You should give an image at first!"
             
-        self.conversation.append_message(self.conversation.roles[0], input_text)
-        self.conversation.append_message(self.conversation.roles[1], None)
+        self.conversation.append_message(self.roles[0], input_text)
+        self.conversation.append_message(self.roles[1], None)
         prompt = self.conversation.get_prompt()
 
         input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(self.model.device)
