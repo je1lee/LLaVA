@@ -118,6 +118,43 @@ class VLMWebUI:
         return streamer
 
     @torch.inference_mode
+    def inference_stateless(self, image: Image.Image, input_text: str) -> str:
+        conversation = self.initialized_conversation()
+        
+        image_size = image.size
+        image_tensor = process_images([image], self.image_processor, self.model.config)
+        if type(image_tensor) is list:
+            image_tensor = [image.to(self.model.device, dtype=torch.float16) for image in image_tensor]
+        else:
+            image_tensor = image_tensor.to(self.model.device, dtype=torch.float16)
+        
+        if self.model.config.mm_use_im_start_end:
+            input_text = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + input_text
+        else:
+            input_text = DEFAULT_IMAGE_TOKEN + '\n' + input_text
+        query_image = QueryImage(tensor=image_tensor, size=image_size)
+        
+        conversation.append_message(self.roles[0], input_text)
+        conversation.append_message(self.roles[1], None)
+        prompt = conversation.get_prompt()
+        del conversation
+
+        input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(self.model.device)
+                
+        output_ids = self.model.generate(
+            input_ids,
+            images=query_image.tensor,
+            image_sizes=[query_image.size],
+            do_sample=True if self.args.temperature > 0 else False,
+            temperature=self.args.temperature,
+            max_new_tokens=self.args.max_new_tokens,
+            use_cache=True
+        )
+        outputs = self.tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()        
+        return outputs
+        
+
+    @torch.inference_mode
     def inference(self, image: Optional[Image.Image], input_text: str) -> str:
         
         if image is not None:
