@@ -1,5 +1,7 @@
 # Modified from LLaVA: https://github.com/haotian-liu/LLaVA.git
 #
+# Modified from LLaVA: https://github.com/haotian-liu/LLaVA.git
+#
 # Adopted from https://github.com/lm-sys/FastChat. Below is the original copyright:
 # Adopted from tatsu-lab@stanford_alpaca. Below is the original copyright:
 #    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
@@ -559,7 +561,9 @@ def preprocess_v1(
 
 
 def preprocess_mpt(
-    sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -581,13 +585,7 @@ def preprocess_mpt(
     # Tokenize conversations
 
     if has_image:
-        input_ids = torch.stack(
-            [
-                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-                for prompt in conversations
-            ],
-            dim=0,
-        )
+        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     else:
         input_ids = tokenizer(
             conversations,
@@ -608,9 +606,7 @@ def preprocess_mpt(
         rounds = conversation.split(conv.sep)
         re_rounds = [conv.sep.join(rounds[:3])]  # system + user + gpt
         for conv_idx in range(3, len(rounds), 2):
-            re_rounds.append(
-                conv.sep.join(rounds[conv_idx : conv_idx + 2])
-            )  # user + gpt
+            re_rounds.append(conv.sep.join(rounds[conv_idx:conv_idx+2]))    # user + gpt
         cur_len = 0
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(re_rounds):
@@ -629,11 +625,7 @@ def preprocess_mpt(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 1
 
-            if (
-                i != 0
-                and getattr(tokenizer, "legacy", False)
-                and IS_TOKENIZER_GREATER_THAN_0_14
-            ):
+            if i != 0 and getattr(tokenizer, 'legacy', False) and IS_TOKENIZER_GREATER_THAN_0_14:
                 round_len += 1
                 instruction_len += 1
 
@@ -657,7 +649,9 @@ def preprocess_mpt(
 
 
 def preprocess_phi3(
-    sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -679,13 +673,7 @@ def preprocess_phi3(
     # Tokenize conversations
 
     if has_image:
-        input_ids = torch.stack(
-            [
-                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-                for prompt in conversations
-            ],
-            dim=0,
-        )
+        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     else:
         input_ids = tokenizer(
             conversations,
@@ -706,9 +694,7 @@ def preprocess_phi3(
         rounds = conversation.split(conv.sep)
         re_rounds = [conv.sep.join(rounds[:3])]  # system + user + gpt
         for conv_idx in range(3, len(rounds), 2):
-            re_rounds.append(
-                conv.sep.join(rounds[conv_idx : conv_idx + 2])
-            )  # user + gpt
+            re_rounds.append(conv.sep.join(rounds[conv_idx:conv_idx+2]))    # user + gpt
         cur_len = 0
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(re_rounds):
@@ -734,11 +720,7 @@ def preprocess_phi3(
                 round_len -= 2
                 instruction_len -= 2
 
-            if (
-                i != 0
-                and getattr(tokenizer, "legacy", False)
-                and IS_TOKENIZER_GREATER_THAN_0_14
-            ):
+            if i != 0 and getattr(tokenizer, 'legacy', False) and IS_TOKENIZER_GREATER_THAN_0_14:
                 round_len += 1
                 instruction_len += 1
 
@@ -816,6 +798,8 @@ def preprocess(
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer, has_image=has_image)
+    if conversation_lib.default_conversation.version == "phi3":
+        return preprocess_phi3(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "phi3":
         return preprocess_phi3(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
@@ -906,6 +890,7 @@ def train(attn_implementation="flash_attention_2"):
                 trust_remote_code=True,
             )
             prepare_config_for_training(config, model_args, training_args, data_args)
+            model = LlavaPhiForCausalLM.from_pretrained(
             model = LlavaPhiForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
