@@ -5,9 +5,15 @@ from dataclasses import dataclass, field
 class Dataset:
     dataset_name: str
     dataset_type: str = field(default="torch")
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
-    meta_path: str = field(default=None, metadata={"help": "Path to the meta data for webdataset."})
-    image_path: str = field(default=None, metadata={"help": "Path to the training image data."})
+    data_path: str = field(
+        default=None, metadata={"help": "Path to the training data."}
+    )
+    meta_path: str = field(
+        default=None, metadata={"help": "Path to the meta data for webdataset."}
+    )
+    image_path: str = field(
+        default=None, metadata={"help": "Path to the training image data."}
+    )
     description: str = field(
         default=None,
         metadata={
@@ -26,7 +32,9 @@ import warnings
 def add_dataset(dataset):
     if dataset.dataset_name in DATASETS:
         # make sure the data_name is unique
-        warnings.warn(f"{dataset.dataset_name} already existed in DATASETS. Make sure the name is unique.")
+        warnings.warn(
+            f"{dataset.dataset_name} already existed in DATASETS. Make sure the name is unique."
+        )
     assert "+" not in dataset.dataset_name, "Dataset name cannot include symbol '+'."
     DATASETS.update({dataset.dataset_name: dataset})
 
@@ -36,16 +44,24 @@ def register_datasets_mixtures():
     llava_1_5_mm_align = Dataset(
         dataset_name="llava_1_5_mm_align",
         dataset_type="torch",
-        data_path="./playground/data/LLaVA-Pretrain/LLaVA-CC3M-Pretrain-595K.json",
-        image_path="./playground/data/LLaVA-Pretrain/images",
+        data_path="./playground/data/LLaVA-Pretrain/LLaVA-CC3M-Pretrain-595K/LLaVA-CC3M-Pretrain-595K.json",
+        image_path="./playground/data/LLaVA-Pretrain/LLaVA-CC3M-Pretrain-595K/images",
     )
     add_dataset(llava_1_5_mm_align)
 
     # Pretrain
-    coyo_25m = Dataset(dataset_name="coyo", dataset_type="coyo", data_path="./playground/data/coyo-700m/pkl02-split")
+    coyo_25m = Dataset(
+        dataset_name="coyo",
+        dataset_type="coyo",
+        data_path="./playground/data/coyo-700m/pkl02-split",
+    )
     add_dataset(coyo_25m)
 
-    mmc4core = Dataset(dataset_name="mmc4core", dataset_type="mmc4", data_path="./playground/data/mmc4-core/pkl-core")
+    mmc4core = Dataset(
+        dataset_name="mmc4core",
+        dataset_type="mmc4",
+        data_path="./playground/data/mmc4-core/pkl-core",
+    )
     add_dataset(mmc4core)
 
     sharegpt4v_pretrain = Dataset(
@@ -137,7 +153,9 @@ def register_datasets_mixtures():
     add_dataset(synthdog_en)
 
     vflan = Dataset(
-        dataset_name="vflan", dataset_type="vflan", data_path="./playground/data/vlm-flan-clean-text1m-nosqa-sharded"
+        dataset_name="vflan",
+        dataset_type="vflan",
+        data_path="./playground/data/vlm-flan-clean-text1m-nosqa-sharded",
     )
     add_dataset(vflan)
 

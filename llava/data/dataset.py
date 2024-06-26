@@ -33,6 +33,7 @@ import numpy as np
 import PIL
 import torch
 import transformers
+import tokenizers
 from datasets import concatenate_datasets, load_dataset
 from PIL import Image, ImageFile
 from pytorchvideo.data.encoded_video import EncodedVideo
@@ -50,17 +51,45 @@ from llava.constants import (
     IMAGE_TOKEN_INDEX,
 )
 from llava.data.datasets_mixture import DATASETS
-from llava.eval.mmmu_utils.data_utils import CAT_SHORT2LONG, construct_prompt, load_yaml, process_single_sample
-from llava.mm_utils import is_gemma_tokenizer, tokenizer_image_token, opencv_extract_frames, process_image
-from llava.model import *
+from llava.eval.mmmu_utils.data_utils import (
+    CAT_SHORT2LONG,
+    construct_prompt,
+    load_yaml,
+    process_single_sample,
+)
+from llava.mm_utils import (
+    is_gemma_tokenizer,
+    tokenizer_image_token,
+    opencv_extract_frames,
+    process_image,
+    get_anyres_image_grid_shape,
+    select_best_resolution,
+)
+from llava.model.language_model.llava_phi3 import LlavaPhiConfig, LlavaPhiForCausalLM
+from llava.model.language_model.llava_mistral import (
+    LlavaMistralConfig,
+    LlavaMistralForCausalLM,
+)
+from llava.model.language_model.llava_llama import (
+    LlavaConfig,
+    LlavaLlamaForCausalLM,
+)
+
 from llava.train.args import DataArguments, TrainingArguments
 from llava.train.llava_trainer import LLaVATrainer
 
+
+from packaging import version
 # torch.backends.cudnn.enabled = False
 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 PIL.Image.MAX_IMAGE_PIXELS = 1000000000
+
+
+IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse(
+    "0.14"
+)
 # local_rank = None
 
 # def rank0_print(*args):
@@ -68,7 +97,9 @@ PIL.Image.MAX_IMAGE_PIXELS = 1000000000
 #         print(*args)
 
 
-def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
+def _tokenize_fn(
+    strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer
+) -> Dict:
     """Tokenize a list of strings."""
     tokenized_list = [
         tokenizer(
@@ -82,7 +113,8 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
     ]
     input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
     input_ids_lens = labels_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
+        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item()
+        for tokenized in tokenized_list
     ]
     return dict(
         input_ids=input_ids,
@@ -116,7 +148,9 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
             from_str = conversation_lib.default_conversation.roles[1]
         else:
             from_str = "unknown"
-        sentence["value"] = BEGIN_SIGNAL + from_str + ": " + sentence["value"] + END_SIGNAL
+        sentence["value"] = (
+            BEGIN_SIGNAL + from_str + ": " + sentence["value"] + END_SIGNAL
+        )
         if get_conversation:
             conversation += sentence["value"]
     conversation += BEGIN_SIGNAL
@@ -135,18 +169,28 @@ def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments) -> D
             if sid == 0 and DEFAULT_IMAGE_TOKEN not in concat_values:
                 sentence["value"] = f"{DEFAULT_IMAGE_TOKEN}\n" + sentence["value"]
             if DEFAULT_IMAGE_TOKEN in sentence["value"]:
-                sentence_chunks = [chunk.strip() for chunk in sentence["value"].split(DEFAULT_IMAGE_TOKEN)]
                 sentence_chunks = [
-                    chunk + " " if not (chunk.endswith("\n")) else chunk for chunk in sentence_chunks[:-1]
+                    chunk.strip()
+                    for chunk in sentence["value"].split(DEFAULT_IMAGE_TOKEN)
+                ]
+                sentence_chunks = [
+                    chunk + " " if not (chunk.endswith("\n")) else chunk
+                    for chunk in sentence_chunks[:-1]
                 ] + [sentence_chunks[-1]]
-                sentence["value"] = f"{DEFAULT_IMAGE_TOKEN}\n".join(sentence_chunks).strip()
+                sentence["value"] = f"{DEFAULT_IMAGE_TOKEN}\n".join(
+                    sentence_chunks
+                ).strip()
 
                 replace_token = DEFAULT_IMAGE_TOKEN
                 if "mmtag" in conversation_lib.default_conversation.version:
                     replace_token = "<Image>" + replace_token + "</Image>"
                 if data_args.mm_use_im_start_end:
-                    replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
-                sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
+                    replace_token = (
+                        DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
+                    )
+                sentence["value"] = sentence["value"].replace(
+                    DEFAULT_IMAGE_TOKEN, replace_token
+                )
 
     return sources
 
@@ -179,7 +223,10 @@ def preprocess_llama_2(
 
     if has_image:
         input_ids = torch.stack(
-            [tokenizer_image_token(prompt, tokenizer, return_tensors="pt") for prompt in conversations],
+            [
+                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+                for prompt in conversations
+            ],
             dim=0,
         )
     else:
@@ -233,7 +280,10 @@ def preprocess_llama_2(
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
                 target[:] = IGNORE_INDEX
-                print(f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}." f" (ignored)")
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" (ignored)"
+                )
 
     return dict(
         input_ids=input_ids,
@@ -270,7 +320,11 @@ def preprocess_llama_3(
 
     if has_image:
         input_ids = torch.stack(
-            [tokenizer_image_token(prompt, tokenizer, return_tensors="pt") for prompt in conversations], dim=0
+            [
+                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+                for prompt in conversations
+            ],
+            dim=0,
         )
     else:
         input_ids = tokenizer(
@@ -292,7 +346,9 @@ def preprocess_llama_3(
         rounds = conversation.split(conv.sep)
         re_rounds = [conv.sep.join(rounds[:3])]  # system + user + gpt
         for conv_idx in range(3, len(rounds), 2):
-            re_rounds.append(conv.sep.join(rounds[conv_idx : conv_idx + 2]))  # user + gpt
+            re_rounds.append(
+                conv.sep.join(rounds[conv_idx : conv_idx + 2])
+            )  # user + gpt
         cur_len = 0
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(re_rounds):
@@ -324,7 +380,10 @@ def preprocess_llama_3(
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
                 target[:] = IGNORE_INDEX
-                print(f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}. {sources}" f" (ignored)")
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}. {sources}"
+                    f" (ignored)"
+                )
 
     return dict(
         input_ids=input_ids,
@@ -361,7 +420,10 @@ def preprocess_v1(
 
     if has_image:
         input_ids = torch.stack(
-            [tokenizer_image_token(prompt, tokenizer, return_tensors="pt") for prompt in conversations],
+            [
+                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+                for prompt in conversations
+            ],
             dim=0,
         )
     else:
@@ -415,7 +477,10 @@ def preprocess_v1(
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
                 target[:] = IGNORE_INDEX
-                print(f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}. {sources}" f" (ignored)")
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}. {sources}"
+                    f" (ignored)"
+                )
 
     return dict(
         input_ids=input_ids,
@@ -451,7 +516,11 @@ def preprocess_mpt(
     # Tokenize conversations
     if has_image:
         input_ids = torch.stack(
-            [tokenizer_image_token(prompt, tokenizer, return_tensors="pt") for prompt in conversations], dim=0
+            [
+                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+                for prompt in conversations
+            ],
+            dim=0,
         )
     else:
         input_ids = tokenizer(
@@ -473,7 +542,9 @@ def preprocess_mpt(
         rounds = conversation.split(conv.sep)
         re_rounds = [conv.sep.join(rounds[:3])]  # system + user + gpt
         for conv_idx in range(3, len(rounds), 2):
-            re_rounds.append(conv.sep.join(rounds[conv_idx : conv_idx + 2]))  # user + gpt
+            re_rounds.append(
+                conv.sep.join(rounds[conv_idx : conv_idx + 2])
+            )  # user + gpt
         cur_len = 0
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(re_rounds):
@@ -486,10 +557,14 @@ def preprocess_mpt(
             parts[0] += sep
 
             if has_image:
-                round_len = len(tokenizer_image_token(rou, tokenizer)) + len(tokenizer_image_token(conv.sep, tokenizer))
+                round_len = len(tokenizer_image_token(rou, tokenizer)) + len(
+                    tokenizer_image_token(conv.sep, tokenizer)
+                )
                 instruction_len = len(tokenizer_image_token(parts[0], tokenizer))
             else:
-                round_len = len(tokenizer(rou).input_ids) + len(tokenizer(conv.sep).input_ids)
+                round_len = len(tokenizer(rou).input_ids) + len(
+                    tokenizer(conv.sep).input_ids
+                )
                 instruction_len = len(tokenizer(parts[0]).input_ids)
 
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
@@ -520,10 +595,17 @@ def preprocess_plain(
         assert len(source) == 2
         assert DEFAULT_IMAGE_TOKEN in source[0]["value"]
         source[0]["value"] = DEFAULT_IMAGE_TOKEN
-        conversation = source[0]["value"] + source[1]["value"] + conversation_lib.default_conversation.sep
+        conversation = (
+            source[0]["value"]
+            + source[1]["value"]
+            + conversation_lib.default_conversation.sep
+        )
         conversations.append(conversation)
     # tokenize conversations
-    input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors="pt") for prompt in conversations]
+    input_ids = [
+        tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+        for prompt in conversations
+    ]
     targets = copy.deepcopy(input_ids)
     for target, source in zip(targets, sources):
         tokenized_len = len(tokenizer_image_token(source[0]["value"], tokenizer))
@@ -532,7 +614,9 @@ def preprocess_plain(
     return dict(input_ids=input_ids, labels=targets)
 
 
-def preprocess_phi3(sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False) -> Dict:
+def preprocess_phi3(
+    sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False
+) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
@@ -554,7 +638,11 @@ def preprocess_phi3(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
 
     if has_image:
         input_ids = torch.stack(
-            [tokenizer_image_token(prompt, tokenizer, return_tensors="pt") for prompt in conversations], dim=0
+            [
+                tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+                for prompt in conversations
+            ],
+            dim=0,
         )
     else:
         input_ids = tokenizer(
@@ -576,7 +664,9 @@ def preprocess_phi3(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
         rounds = conversation.split(conv.sep)
         re_rounds = [conv.sep.join(rounds[:3])]  # system + user + gpt
         for conv_idx in range(3, len(rounds), 2):
-            re_rounds.append(conv.sep.join(rounds[conv_idx : conv_idx + 2]))  # user + gpt
+            re_rounds.append(
+                conv.sep.join(rounds[conv_idx : conv_idx + 2])
+            )  # user + gpt
         cur_len = 0
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(re_rounds):
@@ -602,7 +692,11 @@ def preprocess_phi3(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
                 round_len -= 2
                 instruction_len -= 2
 
-            if i != 0 and getattr(tokenizer, "legacy", False) and IS_TOKENIZER_GREATER_THAN_0_14:
+            if (
+                i != 0
+                and getattr(tokenizer, "legacy", False)
+                and IS_TOKENIZER_GREATER_THAN_0_14
+            ):
                 round_len += 1
                 instruction_len += 1
 
@@ -614,7 +708,10 @@ def preprocess_phi3(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
                 target[:] = IGNORE_INDEX
-                print(f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}." f" (ignored)")
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" (ignored)"
+                )
 
     return dict(
         input_ids=input_ids,
@@ -639,19 +736,41 @@ def preprocess(
         conversation_lib.default_conversation.version == "mpt"
         or conversation_lib.default_conversation.version == "hermes-2"
     ):
-        return preprocess_mpt(sources, tokenizer, has_image=has_image, no_system_prompt=no_system_prompt)
-    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
+        return preprocess_mpt(
+            sources, tokenizer, has_image=has_image, no_system_prompt=no_system_prompt
+        )
+    if (
+        conversation_lib.default_conversation.sep_style
+        == conversation_lib.SeparatorStyle.PLAIN
+    ):
         return preprocess_plain(sources, tokenizer)
-    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
+    if (
+        conversation_lib.default_conversation.sep_style
+        == conversation_lib.SeparatorStyle.LLAMA_2
+    ):
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
-    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.MISTRAL:
-        return preprocess_llama_2(sources, tokenizer, has_image=has_image, is_mistral=True)
-    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_3:
-        return preprocess_llama_3(sources, tokenizer, has_image=has_image, no_system_prompt=no_system_prompt)
+    if (
+        conversation_lib.default_conversation.sep_style
+        == conversation_lib.SeparatorStyle.MISTRAL
+    ):
+        return preprocess_llama_2(
+            sources, tokenizer, has_image=has_image, is_mistral=True
+        )
+    if (
+        conversation_lib.default_conversation.sep_style
+        == conversation_lib.SeparatorStyle.LLAMA_3
+    ):
+        return preprocess_llama_3(
+            sources, tokenizer, has_image=has_image, no_system_prompt=no_system_prompt
+        )
     if conversation_lib.default_conversation.version.startswith("v1"):
-        return preprocess_v1(sources, tokenizer, has_image=has_image, no_system_prompt=no_system_prompt)
+        return preprocess_v1(
+            sources, tokenizer, has_image=has_image, no_system_prompt=no_system_prompt
+        )
     if conversation_lib.default_conversation.version == "phi3":
-        return preprocess_phi3(sources, tokenizer, has_image=has_image, no_system_prompt=no_system_prompt)
+        return preprocess_phi3(
+            sources, tokenizer, has_image=has_image, no_system_prompt=no_system_prompt
+        )
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -664,7 +783,10 @@ def preprocess(
         return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
 
     if has_image:
-        input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors="pt") for prompt in conversations]
+        input_ids = [
+            tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+            for prompt in conversations
+        ]
     else:
         conversations_tokenized = _tokenize_fn(conversations, tokenizer)
         input_ids = conversations_tokenized["input_ids"]
@@ -674,7 +796,9 @@ def preprocess(
         if has_image:
             tokenized_lens = get_tokenize_len([header] + [s["value"] for s in source])
         else:
-            tokenized_lens = _tokenize_fn([header] + [s["value"] for s in source], tokenizer)["input_ids_lens"]
+            tokenized_lens = _tokenize_fn(
+                [header] + [s["value"] for s in source], tokenizer
+            )["input_ids_lens"]
         speakers = [sentence["from"] for sentence in source]
         _mask_targets(target, tokenized_lens, speakers)
 
@@ -743,14 +867,19 @@ class DummyDataset(Dataset):
         length_list = []
         for sample in self.list_data_dict:
             img_tokens = 128 if "image" in sample else 0
-            length_list.append(sum(len(conv["value"].split()) for conv in sample["conversations"]) + img_tokens)
+            length_list.append(
+                sum(len(conv["value"].split()) for conv in sample["conversations"])
+                + img_tokens
+            )
         return length_list
 
     @property
     def modality_lengths(self):
         length_list = []
         for sample in self.list_data_dict:
-            cur_len = sum(len(conv["value"].split()) for conv in sample["conversations"])
+            cur_len = sum(
+                len(conv["value"].split()) for conv in sample["conversations"]
+            )
             cur_len = cur_len if "image" in sample else -cur_len
             length_list.append(cur_len)
         return length_list
@@ -763,7 +892,9 @@ class DummyDataset(Dataset):
         if "image" in sources[0]:
             image_file = self.list_data_dict[i]["image"]
             image = process_image(image_file, self.data_args, self.image_folder)
-            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+            sources = preprocess_multimodal(
+                copy.deepcopy([e["conversations"] for e in sources]), self.data_args
+            )
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
 
@@ -777,7 +908,9 @@ class DummyDataset(Dataset):
             ),
         )
         if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
+            data_dict = dict(
+                input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0]
+            )
 
         # image exist in the data
         if "image" in self.list_data_dict[i]:
@@ -824,20 +957,27 @@ class LazySupervisedDataset(Dataset):
         length_list = []
         for sample in self.list_data_dict:
             img_tokens = 128 if "image" in sample else 0
-            length_list.append(sum(len(conv["value"].split()) for conv in sample["conversations"]) + img_tokens)
+            length_list.append(
+                sum(len(conv["value"].split()) for conv in sample["conversations"])
+                + img_tokens
+            )
         return length_list
 
     @property
     def modality_lengths(self):
         length_list = []
         for sample in self.list_data_dict:
-            cur_len = sum(len(conv["value"].split()) for conv in sample["conversations"])
+            cur_len = sum(
+                len(conv["value"].split()) for conv in sample["conversations"]
+            )
             cur_len = cur_len if "image" in sample else -cur_len
             length_list.append(cur_len)
         return length_list
 
     @staticmethod
-    def _load_video(video_path, num_video_frames, data_args, fps=None, frame_count=None):
+    def _load_video(
+        video_path, num_video_frames, data_args, fps=None, frame_count=None
+    ):
         from llava.mm_utils import opencv_extract_frames
         from torchvision import transforms
 
@@ -847,13 +987,17 @@ class LazySupervisedDataset(Dataset):
         else:
             image_size = data_args.image_processor.size["height"]
         try:
-            pil_imgs = opencv_extract_frames(video_path, num_video_frames, fps, frame_count)
+            pil_imgs = opencv_extract_frames(
+                video_path, num_video_frames, fps, frame_count
+            )
         except Exception as e:
             video_loading_succeed = False
             print(f"bad data path {video_path}")
             print(f"[DEBUG] Error processing {video_path}: {e}")
             # video_outputs = torch.zeros(3, 8, image_size, image_size, dtype=torch.uint8)
-            pil_imgs = [torch.zeros(3, image_size, image_size, dtype=torch.float32)] * num_video_frames
+            pil_imgs = [
+                torch.zeros(3, image_size, image_size, dtype=torch.float32)
+            ] * num_video_frames
             pil_imgs = [Image.new("RGB", (448, 448), (0, 0, 0))] * num_video_frames
 
         return pil_imgs, video_loading_succeed
@@ -866,10 +1010,17 @@ class LazySupervisedDataset(Dataset):
         if "image" in sources[0]:
             image_file = self.list_data_dict[i]["image"]
             if isinstance(image_file, list):
-                image = torch.stack([process_image(img, self.data_args, self.image_folder) for img in image_file])
+                image = torch.stack(
+                    [
+                        process_image(img, self.data_args, self.image_folder)
+                        for img in image_file
+                    ]
+                )
             else:
                 image = process_image(image_file, self.data_args, self.image_folder)
-            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+            sources = preprocess_multimodal(
+                copy.deepcopy([e["conversations"] for e in sources]), self.data_args
+            )
         elif ("video" in sources[0]) or ("video_id" in sources[0]):
             num_video_frames = self.data_args.num_video_frames
             if "video" in sources[0]:
@@ -888,10 +1039,16 @@ class LazySupervisedDataset(Dataset):
                 frame_count = None
 
             images, video_loading_succeed = self._load_video(
-                video_path, num_video_frames, self.data_args, fps=fps, frame_count=frame_count
+                video_path,
+                num_video_frames,
+                self.data_args,
+                fps=fps,
+                frame_count=frame_count,
             )
 
-            image_tensor = torch.stack([process_image(image, self.data_args, None) for image in images])
+            image_tensor = torch.stack(
+                [process_image(image, self.data_args, None) for image in images]
+            )
 
             if "video" in sources[0]:
                 question = sources[0]["conversations"][0]["value"].rstrip()
@@ -903,8 +1060,16 @@ class LazySupervisedDataset(Dataset):
             if not video_loading_succeed:
                 answer = "Empty video."
 
-            question = question.replace("<image>\n", "").replace("\n<image>", "").replace("<image>", "")
-            question = question.replace("<video>\n", "").replace("\n<video>", "").replace("<video>", "")
+            question = (
+                question.replace("<image>\n", "")
+                .replace("\n<image>", "")
+                .replace("<image>", "")
+            )
+            question = (
+                question.replace("<video>\n", "")
+                .replace("\n<video>", "")
+                .replace("<video>", "")
+            )
             question = "<image>\n" * num_video_frames + question
             conversation = [
                 {"from": "human", "value": question},
@@ -926,7 +1091,9 @@ class LazySupervisedDataset(Dataset):
             ),
         )
         if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
+            data_dict = dict(
+                input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0]
+            )
 
         # image exist in the data
         if "image" in self.list_data_dict[i]:
@@ -934,7 +1101,9 @@ class LazySupervisedDataset(Dataset):
                 data_dict["image"] = image
             else:
                 data_dict["image"] = image.unsqueeze(0)
-        elif ("video" in self.list_data_dict[i]) or ("video_id" in self.list_data_dict[i]):
+        elif ("video" in self.list_data_dict[i]) or (
+            "video_id" in self.list_data_dict[i]
+        ):
             data_dict["image"] = image_tensor
             if not video_loading_succeed:
                 data_dict["labels"][:] = IGNORE_INDEX
@@ -972,8 +1141,13 @@ class LazyMMC4Dataset(Dataset):
         # actually shards and stats info
         n_shards = len(os.listdir(data_path)) // 2
         # n_shards = 100
-        count_info_list = sorted([f for f in os.listdir(data_path) if f.endswith(".count")])[:n_shards]
-        n_samples = [int(open(os.path.join(data_path, f), "r").read().strip()) for f in count_info_list]
+        count_info_list = sorted(
+            [f for f in os.listdir(data_path) if f.endswith(".count")]
+        )[:n_shards]
+        n_samples = [
+            int(open(os.path.join(data_path, f), "r").read().strip())
+            for f in count_info_list
+        ]
 
         print("total MMC4 samples", sum(n_samples))  # 10,881,869
 
@@ -981,7 +1155,10 @@ class LazyMMC4Dataset(Dataset):
         world_size = training_args.world_size  # int(os.environ["WORLD_SIZE"])
         shared_size = n_shards // world_size
 
-        gpu_samples = [sum(n_samples[i * shared_size : (i + 1) * shared_size]) for i in range(world_size)]
+        gpu_samples = [
+            sum(n_samples[i * shared_size : (i + 1) * shared_size])
+            for i in range(world_size)
+        ]
         self.n_samples = min(gpu_samples) * world_size  # total size
         self.idx_offset = rank * min(gpu_samples)
         shard_start, shard_end = rank * shared_size, (rank + 1) * shared_size
@@ -1020,9 +1197,14 @@ class LazyMMC4Dataset(Dataset):
         length_list = []
         for info in self.data_list:
             num_images = min(6, len(info["image_info"]))
-            sentences = [info["text_list"][x["matched_text_index"]] for x in info["image_info"][:num_images]]
+            sentences = [
+                info["text_list"][x["matched_text_index"]]
+                for x in info["image_info"][:num_images]
+            ]
             # The unit of cur_len is "words". We assume 1 word = 2 tokens.
-            cur_len = num_images * self.num_image_tokens // 2 + sum([len(x) for x in sentences])
+            cur_len = num_images * self.num_image_tokens // 2 + sum(
+                [len(x) for x in sentences]
+            )
             length_list.append(cur_len)
         return length_list
 
@@ -1080,7 +1262,12 @@ class LazyMMC4Dataset(Dataset):
         text = f"{text}{self.tokenizer.eos_token}"  # add eos token
 
         if len(images) > 0:
-            images = torch.stack([process_image(image, self.data_args, self.image_folder) for image in images])
+            images = torch.stack(
+                [
+                    process_image(image, self.data_args, self.image_folder)
+                    for image in images
+                ]
+            )
 
             # the same size for all images, so we concat
             # cur_token_len = (
@@ -1104,7 +1291,9 @@ class LazyMMC4Dataset(Dataset):
 
         # now check the case where the last token is image patch token
         if input_ids[-1] == IMAGE_TOKEN_INDEX:  # need to remove one last image
-            last_non_im_patch_indices = torch.where(input_ids != IMAGE_TOKEN_INDEX)[0][-1] + 1
+            last_non_im_patch_indices = (
+                torch.where(input_ids != IMAGE_TOKEN_INDEX)[0][-1] + 1
+            )
             input_ids = input_ids[:last_non_im_patch_indices]
 
         n_im_patch = (input_ids == IMAGE_TOKEN_INDEX).sum().item()
@@ -1117,16 +1306,24 @@ class LazyMMC4Dataset(Dataset):
         if self.image_following_text_only:  # keep only text after leading image token
             # remove loss for any token before the first <image> token
             label_idx = 0
-            while label_idx < targets.shape[-1] and targets[label_idx] != IMAGE_TOKEN_INDEX:
+            while (
+                label_idx < targets.shape[-1]
+                and targets[label_idx] != IMAGE_TOKEN_INDEX
+            ):
                 targets[label_idx] = IGNORE_INDEX
                 label_idx += 1
 
-            pad_token = self.tokenizer.convert_tokens_to_ids([self.tokenizer.pad_token])[0]
+            pad_token = self.tokenizer.convert_tokens_to_ids(
+                [self.tokenizer.pad_token]
+            )[0]
 
             pad_token_idxs = torch.where(targets == pad_token)[0]
             for pad_token_idx in pad_token_idxs:
                 token_idx = pad_token_idx + 1
-                while token_idx < targets.shape[-1] and targets[token_idx] != IMAGE_TOKEN_INDEX:
+                while (
+                    token_idx < targets.shape[-1]
+                    and targets[token_idx] != IMAGE_TOKEN_INDEX
+                ):
                     targets[token_idx] = IGNORE_INDEX
                     token_idx += 1
             # do not train on padding tokens
@@ -1163,8 +1360,13 @@ class LazyCoyoDataset(Dataset):
         # actually shards and stats info
         n_shards = len(os.listdir(data_path)) // 2
         # n_shards = 100
-        count_info_list = sorted([f for f in os.listdir(data_path) if f.endswith(".count")])[:n_shards]
-        n_samples = [int(open(os.path.join(data_path, f), "r").read().strip()) for f in count_info_list]
+        count_info_list = sorted(
+            [f for f in os.listdir(data_path) if f.endswith(".count")]
+        )[:n_shards]
+        n_samples = [
+            int(open(os.path.join(data_path, f), "r").read().strip())
+            for f in count_info_list
+        ]
 
         print("total COYO samples", sum(n_samples))
 
@@ -1173,7 +1375,8 @@ class LazyCoyoDataset(Dataset):
         shared_size = n_shards // world_size
 
         gpu_samples = [
-            sum(n_samples[i * shared_size : (i + 1) * shared_size]) // n_samples_per_idx for i in range(world_size)
+            sum(n_samples[i * shared_size : (i + 1) * shared_size]) // n_samples_per_idx
+            for i in range(world_size)
         ]
         self.n_samples = min(gpu_samples) * world_size  # total size
         self.idx_offset = rank * min(gpu_samples)
@@ -1200,7 +1403,8 @@ class LazyCoyoDataset(Dataset):
         # now pack the samples into groups
         n_groups = len(full_data_list) // n_samples_per_idx
         full_data_list = [
-            full_data_list[i : i + n_samples_per_idx] for i in range(0, len(full_data_list), n_samples_per_idx)
+            full_data_list[i : i + n_samples_per_idx]
+            for i in range(0, len(full_data_list), n_samples_per_idx)
         ]
         if len(full_data_list[-1]) < n_samples_per_idx:
             full_data_list = full_data_list[:-1]
@@ -1222,7 +1426,12 @@ class LazyCoyoDataset(Dataset):
         # Estimate the number of tokens after tokenization, used for length-grouped sampling
         length_list = []
         for samples in self.data_list:
-            cur_len = sum([len(conv["text" if "text" in conv else "caption"].split()) for conv in samples])
+            cur_len = sum(
+                [
+                    len(conv["text" if "text" in conv else "caption"].split())
+                    for conv in samples
+                ]
+            )
             # The unit of cur_len is "words". We assume 1 word = 2 tokens.
             cur_len = cur_len + len(samples) * self.num_image_tokens // 2
             length_list.append(cur_len)
@@ -1242,7 +1451,9 @@ class LazyCoyoDataset(Dataset):
             # kentang-mit@: remove existing <image> token.
             # if this is an html tag, we still preserve its semantic meaning
             sample[caption_key] = sample[caption_key].replace("<image>", "<IMAGE>")
-            text_list.append(DEFAULT_IMAGE_TOKEN + sample[caption_key] + self.tokenizer.eos_token)
+            text_list.append(
+                DEFAULT_IMAGE_TOKEN + sample[caption_key] + self.tokenizer.eos_token
+            )
             if "image" in sample:
                 image_base64 = sample["image"]
                 rawbytes = base64.b64decode(image_base64)
@@ -1251,7 +1462,12 @@ class LazyCoyoDataset(Dataset):
             image = Image.open(io.BytesIO(rawbytes)).convert("RGB")
             image_list.append(image)
 
-        image_list = torch.stack([process_image(image, self.data_args, self.image_folder) for image in image_list])
+        image_list = torch.stack(
+            [
+                process_image(image, self.data_args, self.image_folder)
+                for image in image_list
+            ]
+        )
 
         # the same size for all images, so we concat
         # cur_token_len = (
@@ -1331,13 +1547,18 @@ class LazyWDSDataset(Dataset):
         world_size = training_args.world_size  # int(os.environ["WORLD_SIZE"])
         shared_size = n_shards // world_size
 
-        gpu_samples = [sum(n_samples[i * shared_size : (i + 1) * shared_size]) for i in range(world_size)]
+        gpu_samples = [
+            sum(n_samples[i * shared_size : (i + 1) * shared_size])
+            for i in range(world_size)
+        ]
         self.n_samples = min(gpu_samples) * world_size  # total size
         self.idx_offset = rank * min(gpu_samples)
         shard_start, shard_end = rank * shared_size, (rank + 1) * shared_size
         print(f" * loading data from shard {shard_start}-{shard_end}")
 
-        tar_list = [f"{shard_idx:05d}.tar" for shard_idx in range(shard_start, shard_end)]
+        tar_list = [
+            f"{shard_idx:05d}.tar" for shard_idx in range(shard_start, shard_end)
+        ]
 
         self.data_list = []
         t1 = time.time()
@@ -1382,7 +1603,9 @@ class LazyWDSDataset(Dataset):
         # one example of sources
         # [{'id': 'GCC_train_001738742', 'image': 'GCC_train_001738742.jpg', 'conversations': [{'from': 'human', 'value': 'Provide a brief description of the given image.\n<image>'}, {'from': 'gpt', 'value': 'a sketch of an ostrich'}]}]
         if "image" in sources[0]:
-            image = process_image(sources[0]["image"], self.data_args, self.image_folder)
+            image = process_image(
+                sources[0]["image"], self.data_args, self.image_folder
+            )
             image = torch.unsqueeze(image, dim=0)
             # now random pick some context samples for training
             if hasattr(self.data_args, "num_shots"):
@@ -1391,10 +1614,14 @@ class LazyWDSDataset(Dataset):
         else:
             raise NotImplementedError
 
-        data_dict = preprocess([sources[0]["conversations"]], self.tokenizer, has_image=True)
+        data_dict = preprocess(
+            [sources[0]["conversations"]], self.tokenizer, has_image=True
+        )
 
         if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
+            data_dict = dict(
+                input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0]
+            )
 
         # image exist in the data
         if image is not None:
@@ -1446,8 +1673,13 @@ class LazyVFlanDataset(Dataset):
             n_samples = []
             # actually shards and stats info
             n_shards = len(os.listdir(data_path)) // 2
-            count_info_list = sorted([f for f in os.listdir(data_path) if f.endswith(".count")])[:n_shards]
-            n_samples = [int(open(os.path.join(data_path, f), "r").read().strip()) for f in count_info_list]
+            count_info_list = sorted(
+                [f for f in os.listdir(data_path) if f.endswith(".count")]
+            )[:n_shards]
+            n_samples = [
+                int(open(os.path.join(data_path, f), "r").read().strip())
+                for f in count_info_list
+            ]
             self.n_samples = sum(n_samples)
             print("total VFlan samples", sum(n_samples))  # 10,881,869
 
@@ -1455,7 +1687,10 @@ class LazyVFlanDataset(Dataset):
             world_size = training_args.world_size  # int(os.environ["WORLD_SIZE"])
             shared_size = n_shards // world_size
 
-            gpu_samples = [sum(n_samples[i * shared_size : (i + 1) * shared_size]) for i in range(world_size)]
+            gpu_samples = [
+                sum(n_samples[i * shared_size : (i + 1) * shared_size])
+                for i in range(world_size)
+            ]
             self.n_samples = min(gpu_samples) * world_size  # total size
             self.idx_offset = rank * min(gpu_samples)
             shard_start, shard_end = rank * shared_size, (rank + 1) * shared_size
@@ -1497,7 +1732,10 @@ class LazyVFlanDataset(Dataset):
             images = [images]
         assert len(images) <= 8, "Too many images in one sample {}".format(len(images))
         if len(images) == 8:  # sample it to be 4
-            if hasattr(self.data_args, "downsample_video") and self.data_args.downsample_video:
+            if (
+                hasattr(self.data_args, "downsample_video")
+                and self.data_args.downsample_video
+            ):
                 images = images[::2]
         n_images = len(images)
 
@@ -1509,14 +1747,19 @@ class LazyVFlanDataset(Dataset):
                 rawbytes = base64.b64decode(image_str)
                 decode_images.append(Image.open(io.BytesIO(rawbytes)).convert("RGB"))
 
-        images = [process_image(img, self.data_args, image_folder=self.image_folder) for img in decode_images]
+        images = [
+            process_image(img, self.data_args, image_folder=self.image_folder)
+            for img in decode_images
+        ]
 
         # kentang-mit@: num_shots is not part of data_args. not included now.
         # if self.multimodal_cfg["num_shots"] > 0:
         #     raise NotImplementedError  # do not support multi-shot for FLAN
 
         # let's make sure there is no <image> in the question...
-        if "Image Descriptions" in question:  # NOTE: specicial handlement for generation_visual-dialog_train.pkl
+        if (
+            "Image Descriptions" in question
+        ):  # NOTE: specicial handlement for generation_visual-dialog_train.pkl
             question_split = question.split("\nQuestion: ")[1:]
             qa_pairs = []
             for qa in question_split:
@@ -1531,7 +1774,11 @@ class LazyVFlanDataset(Dataset):
                 conversation.append({"from": "human", "value": q})
                 conversation.append({"from": "gpt", "value": a})
         else:
-            question = question.replace("<image>\n", "").replace("\n<image>", "").replace("<image>", "")
+            question = (
+                question.replace("<image>\n", "")
+                .replace("\n<image>", "")
+                .replace("<image>", "")
+            )
             question = "<image>\n" * n_images + question
             conversation = [
                 {"from": "human", "value": question},
@@ -1564,7 +1811,9 @@ class LazyVFlanDataset(Dataset):
         )
 
         if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
+            data_dict = dict(
+                input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0]
+            )
 
         if len(images) > 0:
             data_dict["image"] = torch.stack(images)
@@ -1651,7 +1900,9 @@ class LazyCCSWebDataset(Dataset):
         # one example of sources
         # [{'id': 'GCC_train_001738742', 'image': 'GCC_train_001738742.jpg', 'conversations': [{'from': 'human', 'value': 'Provide a brief description of the given image.\n<image>'}, {'from': 'gpt', 'value': 'a sketch of an ostrich'}]}]
         if "image" in sources[0]:
-            image = process_image(sources[0]["image"], self.data_args, image_folder=None)
+            image = process_image(
+                sources[0]["image"], self.data_args, image_folder=None
+            )
             image = torch.unsqueeze(image, dim=0)
             # now random pick some context samples for training
             if hasattr(self.data_args, "num_shots"):
@@ -1660,10 +1911,14 @@ class LazyCCSWebDataset(Dataset):
         else:
             raise NotImplementedError
 
-        data_dict = preprocess([sources[0]["conversations"]], self.tokenizer, has_image=True)
+        data_dict = preprocess(
+            [sources[0]["conversations"]], self.tokenizer, has_image=True
+        )
 
         if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
+            data_dict = dict(
+                input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0]
+            )
 
         # image exist in the data
         if image is not None:
@@ -1720,7 +1975,9 @@ class LazyEvaluateDataset(LazySupervisedDataset):
             processed_dict = construct_prompt(sample, self.config)
 
             if "<image>" in processed_dict["gt_content"]:
-                processed_dict["gt_content"] = processed_dict["gt_content"].replace("<image>", "image")
+                processed_dict["gt_content"] = processed_dict["gt_content"].replace(
+                    "<image>", "image"
+                )
             sample["conversations"] = [
                 {"from": "human", "value": processed_dict["final_input_prompt"]},
                 {"from": "gpt", "value": processed_dict["gt_content"]},
@@ -1750,7 +2007,9 @@ class LazyCoyoWebDataset(Dataset):
         from llava.data.simple_vila_webdataset import VILAWebDataset
 
         print("[DEBUG] ", osp.abspath(data_path))
-        self.dataset = VILAWebDataset(data_path=osp.abspath(data_path), meta_path=data_args.meta_path)
+        self.dataset = VILAWebDataset(
+            data_path=osp.abspath(data_path), meta_path=data_args.meta_path
+        )
 
         # None: use original caption
         # Folder path: use original caption
@@ -1774,7 +2033,12 @@ class LazyCoyoWebDataset(Dataset):
         # Estimate the number of tokens after tokenization, used for length-grouped sampling
         length_list = []
         for samples in self.data_list:
-            cur_len = sum([len(conv["text" if "text" in conv else "caption"].split()) for conv in samples])
+            cur_len = sum(
+                [
+                    len(conv["text" if "text" in conv else "caption"].split())
+                    for conv in samples
+                ]
+            )
             # The unit of cur_len is "words". We assume 1 word = 2 tokens.
             cur_len = cur_len + len(samples) * self.num_image_tokens // 2
             length_list.append(cur_len)
@@ -1814,7 +2078,9 @@ class LazyCoyoWebDataset(Dataset):
                 # load new captions
                 shard = info["__shard__"]
                 url = info[".json"]["url"]
-                tar_name = osp.relpath(osp.realpath(shard), osp.realpath(self.data_path))
+                tar_name = osp.relpath(
+                    osp.realpath(shard), osp.realpath(self.data_path)
+                )
                 # tar_name = osp.dirname(shard)
                 shard_json_path = osp.join(self.caption_choice, tar_name + ".json")
                 shard_json = lru_json_load(shard_json_path)
@@ -1822,7 +2088,9 @@ class LazyCoyoWebDataset(Dataset):
                 try:
                     caption = shard_json[url]["output"]
                 except KeyError:
-                    print(f"{url} not in caption. fallback to original caption temporarially")
+                    print(
+                        f"{url} not in caption. fallback to original caption temporarially"
+                    )
 
             caption = caption.replace("<image>", "<IMAGE>")
             text_list.append(DEFAULT_IMAGE_TOKEN + caption + self.tokenizer.eos_token)
@@ -1838,7 +2106,12 @@ class LazyCoyoWebDataset(Dataset):
 
             image_list.append(image_path)
 
-        image_list = torch.stack([process_image(image, self.data_args, image_folder=None) for image in image_list])
+        image_list = torch.stack(
+            [
+                process_image(image, self.data_args, image_folder=None)
+                for image in image_list
+            ]
+        )
 
         if CONCAT_SAMPLES:
             # into <image>cap<eos><image>cap<eos>...
@@ -1916,7 +2189,12 @@ class LazyVideoWebDataset(Dataset):
         # Estimate the number of tokens after tokenization, used for length-grouped sampling
         length_list = []
         for samples in self.data_list:
-            cur_len = sum([len(conv["text" if "text" in conv else "caption"].split()) for conv in samples])
+            cur_len = sum(
+                [
+                    len(conv["text" if "text" in conv else "caption"].split())
+                    for conv in samples
+                ]
+            )
             # The unit of cur_len is "words". We assume 1 word = 2 tokens.
             cur_len = cur_len + len(samples) * self.num_image_tokens // 2
             length_list.append(cur_len)
@@ -1935,14 +2213,18 @@ class LazyVideoWebDataset(Dataset):
             video_path = None
             caption = "Empty video."
 
-        images, video_loading_succeed = LazySupervisedDataset._load_video(video_path, num_video_frames, self.data_args)
+        images, video_loading_succeed = LazySupervisedDataset._load_video(
+            video_path, num_video_frames, self.data_args
+        )
 
         if not video_loading_succeed:
             caption = "Empty video."
 
         prompt = "<image>\n" * num_video_frames + caption
 
-        image_tensor = torch.stack([process_image(image, self.data_args, None) for image in images])
+        image_tensor = torch.stack(
+            [process_image(image, self.data_args, None) for image in images]
+        )
 
         input_ids = tokenizer_image_token(
             prompt,
@@ -2004,7 +2286,9 @@ class DataCollatorForSupervisedDataset(object):
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=IGNORE_INDEX
+        )
         input_ids = input_ids[:, : self.tokenizer.model_max_length]
         labels = labels[:, : self.tokenizer.model_max_length]
         batch = dict(
@@ -2046,9 +2330,15 @@ def make_supervised_data_module(
     This function is originally implemented by the LLaVA team and
     modified by Jason Lu, Haotian Tang and Ligeng Zhu."""
     datasets_mixture.register_datasets_mixtures()
-    train_dataset = build_datasets(data_args, training_args=training_args, tokenizer=tokenizer, split="train")
-    eval_dataset = build_datasets(data_args, training_args=training_args, tokenizer=tokenizer, split="eval")
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, data_args=data_args)
+    train_dataset = build_datasets(
+        data_args, training_args=training_args, tokenizer=tokenizer, split="train"
+    )
+    eval_dataset = build_datasets(
+        data_args, training_args=training_args, tokenizer=tokenizer, split="eval"
+    )
+    data_collator = DataCollatorForSupervisedDataset(
+        tokenizer=tokenizer, data_args=data_args
+    )
     return dict(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
