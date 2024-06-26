@@ -852,7 +852,7 @@ def preprocess(
     return dict(input_ids=input_ids, labels=targets)
 
 
-def train(attn_implementation=None):
+def train(attn_implementation="flash_attention_2"):
     global local_rank
 
     parser = transformers.HfArgumentParser(
@@ -1065,6 +1065,7 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(
         tokenizer=tokenizer, data_args=data_args, training_args=training_args
     )
+    
     trainer = LLaVATrainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )

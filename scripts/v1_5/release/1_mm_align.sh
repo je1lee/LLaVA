@@ -5,8 +5,8 @@ export CURRENT_RANK=${SLURM_PROCID:-"0"}
 
 echo "MASTER_ADDR="$MASTER_ADDR
 
-bs=${BATCH_SIZE:-8}
-acc_step=${ACC_STEP:-8}
+bs=${BATCH_SIZE:-16}
+acc_step=${ACC_STEP:-4}
 
 # for example, lmsys/vicuna-7b-v1.5
 BASE_MODEL_PATH=${1:-"/workspace/codes/checkpoints/Phi-3-mini-128k-instruct"}
@@ -15,7 +15,7 @@ OUTPUT=${2:-"/workspace/codes/checkpoints/vila-v1.5-mm-align-phi-3"}
 
 MNAME=$(echo $BASE_MODEL_PATH | rev | cut -d "/" -f 1 | rev)
 
-torchrun --nnodes=1 --nproc_per_node=1 --master_port=25001 \
+torchrun --nnodes=1 --nproc_per_node=4 --master_port=25001 \
     --master_addr $MASTER_ADDR --node_rank=0 \
     /workspace/codes/LLaVA/llava/train/train_mem.py \
     --deepspeed /workspace/codes/LLaVA/scripts/zero2.json \
